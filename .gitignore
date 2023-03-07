@@ -1,0 +1,8 @@
+# IDE
+*.xml
+*.iml
+.idea/
+
+# Dist
+obj/
+libs/

